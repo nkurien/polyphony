@@ -1,0 +1,25 @@
+[package]
+name = "engine"
+version = "0.1.0"
+edition = "2021"
+
+# The library target — this is what wasm-pack will compile to WASM later.
+# The DSP logic lives here so both the CLI and the browser can call it.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# The CLI binary — reads a .wav file and prints the detected note name.
+[[bin]]
+name = "detect"
+path = "src/main.rs"
+
+[dependencies]
+# Reads .wav files and gives us raw PCM sample data
+hound = "3.5"
+
+# Fast Fourier Transform — used for frequency analysis
+rustfft = "6.2"
+
+# WASM bindings — lets Rust functions be called from JavaScript
+# Not used in the CLI, but listed now so the lib compiles for both targets
+wasm-bindgen = "0.2"

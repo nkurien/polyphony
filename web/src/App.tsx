@@ -155,7 +155,7 @@ export default function App() {
   return (
     <div className="min-h-screen bg-[#0c0c0c] text-white flex flex-col items-center justify-center gap-12">
       <p className="text-xs tracking-[0.3em] uppercase text-white/20 font-light">
-        Polyphonics
+        Polyphonic
       </p>
 
       {/* Note display */}

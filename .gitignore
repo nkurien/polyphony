@@ -3,3 +3,4 @@ CLAUDE.md
 # Rust build artifacts
 engine/target/
 engine/pkg/
+.vscode

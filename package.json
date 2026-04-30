@@ -2,6 +2,6 @@
   "name": "polyphonic",
   "private": true,
   "scripts": {
-    "build": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --target wasm32-unknown-unknown && source \"$HOME/.cargo/env\" && curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh && cd engine && wasm-pack build --target web --out-dir pkg && cd ../web && npm install && npm run build"
+    "build": "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --target wasm32-unknown-unknown && . \"$HOME/.cargo/env\" && curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh && cd engine && wasm-pack build --target web --out-dir pkg && cd ../web && npm install && npm run build"
   }
 }

@@ -1,0 +1,7 @@
+{
+  "name": "polyphonic",
+  "private": true,
+  "scripts": {
+    "build": "curl https://rustwasm.github.io/wasm-pack/installer/init.sh -sSf | sh && cd engine && wasm-pack build --target web --out-dir pkg && cd ../web && npm install && npm run build"
+  }
+}

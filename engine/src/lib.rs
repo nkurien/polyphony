@@ -180,6 +180,14 @@ pub fn detect_note(samples: &[f32], sample_rate: u32) -> String {
     }
 }
 
+// Returns the raw detected frequency in Hz, or 0.0 if no pitch was found.
+// Used by the frontend to derive both the note name and cents deviation
+// from a single YIN call per frame.
+#[wasm_bindgen]
+pub fn detect_frequency(samples: &[f32], sample_rate: u32) -> f32 {
+    yin_pitch(samples, sample_rate).unwrap_or(0.0)
+}
+
 // --- UNIT TESTS ---
 //
 // `cargo test` runs these. They live inside the library so they have access to private internals.

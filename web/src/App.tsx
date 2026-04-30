@@ -1,16 +1,12 @@
 import { useState, useRef, useCallback } from 'react'
 
-import init, { detect_note } from 'engine'
+import init, { detect_frequency } from 'engine'
 
 const BUFFER_SIZE = 4096
 const CONFIRM_THRESHOLD = 3
 
 type Status = 'idle' | 'loading' | 'listening' | 'error'
 
-// Compute RMS (root mean square) amplitude of a sample buffer.
-// RMS gives a perceptually natural measure of loudness - louder than peak amplitude
-// for typical audio signals, and much more stable frame-to-frame.
-// Returns a value in [0.0, 1.0].
 function rms(samples: Float32Array): number {
   let sum = 0
   for (let i = 0; i < samples.length; i++) {
@@ -19,10 +15,30 @@ function rms(samples: Float32Array): number {
   return Math.sqrt(sum / samples.length)
 }
 
+// Convert a frequency in Hz to a note name like "E2" or "A4".
+// Mirrors the logic in the Rust frequency_to_note function.
+function frequencyToNote(freq: number): string {
+  const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
+  const semitones = Math.round(12 * Math.log2(freq / 440))
+  const midiNote = 69 + semitones
+  const octave = Math.floor(midiNote / 12) - 1
+  const noteIndex = ((midiNote % 12) + 12) % 12
+  return `${noteNames[noteIndex]}${octave}`
+}
+
+// Returns how many cents sharp (+) or flat (-) a frequency is from the nearest semitone.
+// Range is [-50, +50]. 100 cents = 1 semitone.
+function centsDeviation(freq: number): number {
+  const midiNote = Math.round(12 * Math.log2(freq / 440) + 69)
+  const perfectFreq = 440 * Math.pow(2, (midiNote - 69) / 12)
+  return 1200 * Math.log2(freq / perfectFreq)
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>('idle')
   const [note, setNote] = useState<string>('--')
   const [volume, setVolume] = useState<number>(0)
+  const [cents, setCents] = useState<number>(0)
   const [errorMsg, setErrorMsg] = useState<string>('')
 
   const audioCtxRef = useRef<AudioContext | null>(null)
@@ -31,7 +47,7 @@ export default function App() {
   // ScriptProcessorNode runs on the main thread and is deprecated.
   // AudioWorklet runs audio processing in a dedicated thread (much lower latency).
   // Migration steps when ready:
-  //   1. Move the WASM init + detect_note call into a worklet processor file
+  //   1. Move the WASM init + detect_frequency call into a worklet processor file
   //   2. Use a SharedArrayBuffer ring buffer to pass samples from the worklet to the main thread
   //   3. Replace the ScriptProcessorNode below with:
   //        const worklet = new AudioWorkletNode(ctx, 'pitch-detector')
@@ -40,13 +56,13 @@ export default function App() {
   const candidateNoteRef = useRef<string>('')
   const candidateCountRef = useRef<number>(0)
 
-  // Envelope follower for volume smoothing.
-  // Raw RMS jumps around too much frame-to-frame, so we apply different
-  // smoothing rates for attack (rising) and release (falling).
-  // Alpha values are per-frame: higher = faster response, lower = slower decay.
   const smoothedVolumeRef = useRef<number>(0)
-  const ATTACK_ALPHA = 0.6   // responds quickly when volume rises
-  const RELEASE_ALPHA = 0.05 // decays slowly when volume falls
+  const ATTACK_ALPHA = 0.6
+  const RELEASE_ALPHA = 0.05
+
+  // Smooth cents with a gentle EMA to stop it jittering around centre
+  const smoothedCentsRef = useRef<number>(0)
+  const CENTS_ALPHA = 0.15
 
   const startListening = useCallback(async () => {
     setStatus('loading')
@@ -66,19 +82,29 @@ export default function App() {
       processor.onaudioprocess = (event) => {
         const samples = event.inputBuffer.getChannelData(0)
 
-        // Compute RMS then run it through the envelope follower
+        // Volume envelope
         const raw = rms(samples)
         const prev = smoothedVolumeRef.current
         const alpha = raw > prev ? ATTACK_ALPHA : RELEASE_ALPHA
         smoothedVolumeRef.current = alpha * raw + (1 - alpha) * prev
         setVolume(smoothedVolumeRef.current)
 
-        const detected = detect_note(samples, ctx.sampleRate)
+        // Single WASM call gives us the raw frequency.
+        // We derive note name and cents from it in JS so YIN only runs once per frame.
+        const freq = detect_frequency(samples, ctx.sampleRate)
+
+        if (freq === 0) return
+
+        const detected = frequencyToNote(freq)
 
         if (detected === candidateNoteRef.current) {
           candidateCountRef.current += 1
           if (candidateCountRef.current >= CONFIRM_THRESHOLD) {
             setNote(detected)
+            // Smooth the cents value so it doesn't jump frame-to-frame
+            smoothedCentsRef.current =
+              CENTS_ALPHA * centsDeviation(freq) + (1 - CENTS_ALPHA) * smoothedCentsRef.current
+            setCents(smoothedCentsRef.current)
           }
         } else {
           candidateNoteRef.current = detected
@@ -104,19 +130,27 @@ export default function App() {
     candidateNoteRef.current = ''
     candidateCountRef.current = 0
     smoothedVolumeRef.current = 0
+    smoothedCentsRef.current = 0
     setStatus('idle')
     setNote('--')
     setVolume(0)
+    setCents(0)
   }, [])
 
-  // Map RMS volume to note opacity. RMS values for guitar are typically in [0, 0.3],
-  // so we scale up aggressively to make quiet playing still register visually.
-  // Clamped to [0.1, 0.9] so the note never fully disappears or blinds you.
   const noteOpacity = status === 'listening'
     ? Math.min(0.9, Math.max(0.1, volume * 4))
     : 0.9
 
   const volumeBarWidth = `${Math.min(100, volume * 350)}%`
+
+  // Cents bar: clamp to ±50 cents, map to 0–50% of half the bar width.
+  const absCents = Math.abs(cents)
+  const centsBarHalfWidth = `${Math.min(50, absCents)}%`
+  const centsBarSide = cents >= 0 ? 'left' : 'right'
+  // Fade out when close to centre: invisible below 8 cents, fully visible above 25 cents
+  const centsBarOpacity = Math.min(1, Math.max(0, (absCents - 8) / 17))
+  // In-tune dot: fades in below 8 cents, fully visible below 4 cents
+  const inTuneOpacity = status === 'listening' ? Math.min(1, Math.max(0, (8 - absCents) / 4)) : 0
 
   return (
     <div className="min-h-screen bg-[#0c0c0c] text-white flex flex-col items-center justify-center gap-12">
@@ -139,6 +173,33 @@ export default function App() {
         <span className="text-[11px] tracking-[0.25em] uppercase text-white/25">
           {status === 'listening' ? 'Listening' : ' '}
         </span>
+      </div>
+
+      {/* Cents deviation bar — stretches left if flat, right if sharp */}
+      <div className="w-48 h-px bg-white/5 relative">
+        {/* Centre tick */}
+        <div className="absolute left-1/2 -top-1 w-px h-[3px] bg-white/20" />
+        {/* In-tune dot — fades in when within 8 cents of perfect pitch */}
+        <div
+          className="absolute w-[6px] h-[6px] rounded-full bg-emerald-400"
+          style={{
+            left: '50%',
+            top: '50%',
+            transform: 'translate(-50%, -50%)',
+            opacity: inTuneOpacity,
+            transition: 'opacity 150ms ease-out',
+          }}
+        />
+        <div
+          className="absolute top-0 h-full"
+          style={{
+            [centsBarSide]: '50%',
+            width: centsBarHalfWidth,
+            backgroundColor: '#e53935',
+            opacity: centsBarOpacity,
+            transition: 'width 80ms ease-out, opacity 120ms ease-out',
+          }}
+        />
       </div>
 
       {/* Volume bar */}

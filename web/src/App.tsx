@@ -31,6 +31,13 @@ export default function App() {
   //        const worklet = new AudioWorkletNode(ctx, 'pitch-detector')
   const processorRef = useRef<ScriptProcessorNode | null>(null)
 
+  // Confirmation filter state - lives in refs so it persists across audio frames
+  // without causing re-renders. The displayed note only updates after the same
+  // candidate has been detected CONFIRM_THRESHOLD times in a row.
+  const CONFIRM_THRESHOLD = 3
+  const candidateNoteRef = useRef<string>('')
+  const candidateCountRef = useRef<number>(0)
+
   const startListening = useCallback(async () => {
     setStatus('loading')
     setErrorMsg('')
@@ -71,7 +78,20 @@ export default function App() {
         // Call our Rust function compiled to WASM.
         // Returns a note name like "E2" or "A4", or "—" if no pitch was found.
         const detected = detect_note(samples, ctx.sampleRate)
-        setNote(detected)
+
+        // Confirmation filter: only update the display after the same note has been
+        // detected CONFIRM_THRESHOLD frames in a row. This prevents flickering caused
+        // by a single noisy frame slipping through between stable detections.
+        if (detected === candidateNoteRef.current) {
+          candidateCountRef.current += 1
+          if (candidateCountRef.current >= CONFIRM_THRESHOLD) {
+            setNote(detected)
+          }
+        } else {
+          // New candidate - reset the counter
+          candidateNoteRef.current = detected
+          candidateCountRef.current = 1
+        }
       }
 
       source.connect(processor)
@@ -91,6 +111,8 @@ export default function App() {
     processorRef.current = null
     audioCtxRef.current?.close()
     audioCtxRef.current = null
+    candidateNoteRef.current = ''
+    candidateCountRef.current = 0
     setStatus('idle')
     setNote('--')
   }, [])

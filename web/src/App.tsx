@@ -1,24 +1,30 @@
 import { useState, useRef, useCallback } from 'react'
 
-// The WASM package exports a single async init function plus our detect_note function.
-// We must call init() before detect_note() is usable - it loads and compiles the .wasm binary.
 import init, { detect_note } from 'engine'
 
-// How many audio samples to collect before running detection.
-// 4096 samples at 44100 Hz = ~93ms of audio per analysis frame.
-// Larger = more stable detection but higher latency.
 const BUFFER_SIZE = 4096
+const CONFIRM_THRESHOLD = 3
 
 type Status = 'idle' | 'loading' | 'listening' | 'error'
+
+// Compute RMS (root mean square) amplitude of a sample buffer.
+// RMS gives a perceptually natural measure of loudness - louder than peak amplitude
+// for typical audio signals, and much more stable frame-to-frame.
+// Returns a value in [0.0, 1.0].
+function rms(samples: Float32Array): number {
+  let sum = 0
+  for (let i = 0; i < samples.length; i++) {
+    sum += samples[i] * samples[i]
+  }
+  return Math.sqrt(sum / samples.length)
+}
 
 export default function App() {
   const [status, setStatus] = useState<Status>('idle')
   const [note, setNote] = useState<string>('--')
+  const [volume, setVolume] = useState<number>(0)
   const [errorMsg, setErrorMsg] = useState<string>('')
 
-  // We store the AudioContext in a ref rather than state because:
-  // - We need to close it on stop
-  // - We don't want React to re-render when it changes
   const audioCtxRef = useRef<AudioContext | null>(null)
 
   // TODO: Migrate from ScriptProcessorNode to AudioWorklet.
@@ -31,73 +37,57 @@ export default function App() {
   //        const worklet = new AudioWorkletNode(ctx, 'pitch-detector')
   const processorRef = useRef<ScriptProcessorNode | null>(null)
 
-  // Confirmation filter state - lives in refs so it persists across audio frames
-  // without causing re-renders. The displayed note only updates after the same
-  // candidate has been detected CONFIRM_THRESHOLD times in a row.
-  const CONFIRM_THRESHOLD = 3
   const candidateNoteRef = useRef<string>('')
   const candidateCountRef = useRef<number>(0)
+
+  // Envelope follower for volume smoothing.
+  // Raw RMS jumps around too much frame-to-frame, so we apply different
+  // smoothing rates for attack (rising) and release (falling).
+  // Alpha values are per-frame: higher = faster response, lower = slower decay.
+  const smoothedVolumeRef = useRef<number>(0)
+  const ATTACK_ALPHA = 0.6   // responds quickly when volume rises
+  const RELEASE_ALPHA = 0.05 // decays slowly when volume falls
 
   const startListening = useCallback(async () => {
     setStatus('loading')
     setErrorMsg('')
 
     try {
-      // Step 1: initialise the WASM module.
-      // This fetches and compiles engine_bg.wasm - must complete before detect_note() works.
       await init()
 
-      // Step 2: request microphone access.
-      // The browser will prompt the user for permission here.
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
-
-      // Step 3: create an AudioContext.
-      // This is the root of the Web Audio API graph. All nodes live inside it.
       const ctx = new AudioContext()
       audioCtxRef.current = ctx
 
-      // Step 4: build the audio graph.
-      //
-      //   microphone stream
-      //       -> MediaStreamSourceNode  (wraps the mic stream as a Web Audio node)
-      //       -> ScriptProcessorNode    (gives us raw PCM samples to process)
-      //       -> ctx.destination        (we connect here to keep the graph active, but no audible output)
-      //
       const source = ctx.createMediaStreamSource(stream)
-
-      // ScriptProcessorNode fires onaudioprocess whenever it has BUFFER_SIZE new samples ready.
-      // The second and third args are input and output channel counts.
       const processor = ctx.createScriptProcessor(BUFFER_SIZE, 1, 1)
       processorRef.current = processor
 
       processor.onaudioprocess = (event) => {
-        // getChannelData(0) returns the left (or mono) channel as a Float32Array.
-        // Values are already in [-1.0, 1.0] - exactly what our Rust function expects.
         const samples = event.inputBuffer.getChannelData(0)
 
-        // Call our Rust function compiled to WASM.
-        // Returns a note name like "E2" or "A4", or "—" if no pitch was found.
+        // Compute RMS then run it through the envelope follower
+        const raw = rms(samples)
+        const prev = smoothedVolumeRef.current
+        const alpha = raw > prev ? ATTACK_ALPHA : RELEASE_ALPHA
+        smoothedVolumeRef.current = alpha * raw + (1 - alpha) * prev
+        setVolume(smoothedVolumeRef.current)
+
         const detected = detect_note(samples, ctx.sampleRate)
 
-        // Confirmation filter: only update the display after the same note has been
-        // detected CONFIRM_THRESHOLD frames in a row. This prevents flickering caused
-        // by a single noisy frame slipping through between stable detections.
         if (detected === candidateNoteRef.current) {
           candidateCountRef.current += 1
           if (candidateCountRef.current >= CONFIRM_THRESHOLD) {
             setNote(detected)
           }
         } else {
-          // New candidate - reset the counter
           candidateNoteRef.current = detected
           candidateCountRef.current = 1
         }
       }
 
       source.connect(processor)
-      // Must connect to destination or onaudioprocess never fires.
       processor.connect(ctx.destination)
-
       setStatus('listening')
     } catch (err) {
       const msg = err instanceof Error ? err.message : 'Unknown error'
@@ -113,9 +103,20 @@ export default function App() {
     audioCtxRef.current = null
     candidateNoteRef.current = ''
     candidateCountRef.current = 0
+    smoothedVolumeRef.current = 0
     setStatus('idle')
     setNote('--')
+    setVolume(0)
   }, [])
+
+  // Map RMS volume to note opacity. RMS values for guitar are typically in [0, 0.3],
+  // so we scale up aggressively to make quiet playing still register visually.
+  // Clamped to [0.1, 0.9] so the note never fully disappears or blinds you.
+  const noteOpacity = status === 'listening'
+    ? Math.min(0.9, Math.max(0.1, volume * 4))
+    : 0.9
+
+  const volumeBarWidth = `${Math.min(100, volume * 350)}%`
 
   return (
     <div className="min-h-screen bg-[#0c0c0c] text-white flex flex-col items-center justify-center gap-12">
@@ -126,14 +127,30 @@ export default function App() {
       {/* Note display */}
       <div className="flex flex-col items-center gap-4">
         <span
-          style={{ fontFamily: '"Helvetica Neue", Helvetica, Arial, sans-serif' }}
-          className="text-[11rem] leading-none font-light text-white/90 select-none tracking-tight"
+          style={{
+            fontFamily: '"Helvetica Neue", Helvetica, Arial, sans-serif',
+            opacity: noteOpacity,
+            transition: 'opacity 80ms ease-out',
+          }}
+          className="text-[11rem] leading-none font-light text-white select-none tracking-tight"
         >
           {note}
         </span>
         <span className="text-[11px] tracking-[0.25em] uppercase text-white/25">
-          {status === 'listening' ? 'Listening' : ' '}
+          {status === 'listening' ? 'Listening' : ' '}
         </span>
+      </div>
+
+      {/* Volume bar */}
+      <div className="w-48 h-px bg-white/5 relative overflow-hidden">
+        <div
+          className="absolute left-0 top-0 h-full"
+          style={{
+            width: volumeBarWidth,
+            backgroundColor: '#E2622A',
+            transition: 'width 60ms ease-out',
+          }}
+        />
       </div>
 
       {/* Controls */}
@@ -157,7 +174,6 @@ export default function App() {
         </button>
       )}
 
-      {/* Error message */}
       {status === 'error' && (
         <p className="text-white/30 text-xs max-w-sm text-center tracking-wide">{errorMsg}</p>
       )}

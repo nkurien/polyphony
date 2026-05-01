@@ -179,9 +179,11 @@ export default function App() {
   const centsBarHalfWidth = `${Math.min(50, absCents)}%`
   const centsBarSide = cents >= 0 ? 'left' : 'right'
   // Fade out when close to centre: invisible below 8 cents, fully visible above 25 cents
-  const centsBarOpacity = Math.min(1, Math.max(0, (absCents - 8) / 17))
-  // In-tune dot: fades in below 8 cents, fully visible below 4 cents
-  const inTuneOpacity = status === 'listening' ? Math.min(1, Math.max(0, (8 - absCents) / 4)) : 0
+  // Dead zone is 3 cents. Outside it, minimum opacity is 0.55 so the bar is
+  // clearly readable even when nearly in tune. Scales to full brightness at 30+ cents.
+  const centsBarOpacity = absCents < 3 ? 0 : Math.min(1, Math.max(0.55, absCents / 30))
+  // In-tune dot: matches the 3 cent dead zone
+  const inTuneOpacity = status === 'listening' ? Math.min(1, Math.max(0, (3 - absCents) / 1.5)) : 0
 
   return (
     <div className="min-h-screen bg-[#0c0c0c] text-white flex flex-col items-center justify-center gap-12">

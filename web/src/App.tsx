@@ -7,6 +7,13 @@ const CONFIRM_THRESHOLD = 3
 
 type Status = 'idle' | 'loading' | 'listening' | 'error'
 
+// TODO (Level 2 refactor): consolidate music theory logic into Rust.
+// Currently frequencyToNote and centsDeviation are duplicated from lib.rs.
+// The plan is to expose a single `analyse(samples, sample_rate)` function from
+// Rust that returns frequency, note name, and cents in one WASM call, removing
+// the duplication and keeping all music logic in one place.
+// RMS can stay in JS - it's audio infrastructure rather than music logic.
+
 function rms(samples: Float32Array): number {
   let sum = 0
   for (let i = 0; i < samples.length; i++) {
@@ -15,8 +22,7 @@ function rms(samples: Float32Array): number {
   return Math.sqrt(sum / samples.length)
 }
 
-// Convert a frequency in Hz to a note name like "E2" or "A4".
-// Mirrors the logic in the Rust frequency_to_note function.
+// Mirrors the logic in lib.rs frequency_to_note - see TODO above.
 function frequencyToNote(freq: number): string {
   const noteNames = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
   const semitones = Math.round(12 * Math.log2(freq / 440))

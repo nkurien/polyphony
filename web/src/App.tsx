@@ -95,7 +95,7 @@ export default function App() {
       // amplitude doesn't affect pitch accuracy, but boosting helps it clear the
       // silence threshold on quiet devices.
       const gainNode = ctx.createGain()
-      gainNode.gain.value = 3.0
+      gainNode.gain.value = 6.0
       gainNodeRef.current = gainNode
       source.connect(gainNode)
 
@@ -163,10 +163,10 @@ export default function App() {
   }, [])
 
   const noteOpacity = status === 'listening'
-    ? Math.min(0.9, Math.max(0.1, volume * 4))
+    ? Math.min(0.9, Math.max(0.1, volume * 3))
     : 0.9
 
-  const volumeBarWidth = `${Math.min(100, volume * 350)}%`
+  const volumeBarWidth = `${Math.min(100, volume * 200)}%`
 
   // Cents bar: clamp to ±50 cents, map to 0–50% of half the bar width.
   const absCents = Math.abs(cents)

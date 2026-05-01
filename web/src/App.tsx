@@ -42,6 +42,7 @@ export default function App() {
   const [errorMsg, setErrorMsg] = useState<string>('')
 
   const audioCtxRef = useRef<AudioContext | null>(null)
+  const gainNodeRef = useRef<GainNode | null>(null)
 
   // TODO: Migrate from ScriptProcessorNode to AudioWorklet.
   // ScriptProcessorNode runs on the main thread and is deprecated.
@@ -71,13 +72,36 @@ export default function App() {
     try {
       await init()
 
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false })
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          // Disable browser audio processing that interferes with pitch detection.
+          // These are on by default and will duck quiet notes, suppress "noise" that
+          // is actually a guitar string, and normalise volume in ways that break our
+          // amplitude reading -- particularly aggressive on Android.
+          echoCancellation: false,
+          noiseSuppression: false,
+          autoGainControl: false,
+        },
+        video: false,
+      })
       const ctx = new AudioContext()
       audioCtxRef.current = ctx
 
       const source = ctx.createMediaStreamSource(stream)
+
+      // Software gain boost to compensate for low microphone sensitivity on mobile.
+      // Applied before the volume meter so the display reflects the boosted signal.
+      // We pass the boosted samples to YIN too - YIN works on waveform shape so
+      // amplitude doesn't affect pitch accuracy, but boosting helps it clear the
+      // silence threshold on quiet devices.
+      const gainNode = ctx.createGain()
+      gainNode.gain.value = 3.0
+      gainNodeRef.current = gainNode
+      source.connect(gainNode)
+
       const processor = ctx.createScriptProcessor(BUFFER_SIZE, 1, 1)
       processorRef.current = processor
+      gainNode.connect(processor)
 
       processor.onaudioprocess = (event) => {
         const samples = event.inputBuffer.getChannelData(0)
@@ -112,7 +136,6 @@ export default function App() {
         }
       }
 
-      source.connect(processor)
       processor.connect(ctx.destination)
       setStatus('listening')
     } catch (err) {
@@ -125,6 +148,8 @@ export default function App() {
   const stopListening = useCallback(() => {
     processorRef.current?.disconnect()
     processorRef.current = null
+    gainNodeRef.current?.disconnect()
+    gainNodeRef.current = null
     audioCtxRef.current?.close()
     audioCtxRef.current = null
     candidateNoteRef.current = ''

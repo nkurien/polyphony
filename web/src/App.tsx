@@ -69,7 +69,7 @@ export default function App() {
 
   // Smooth cents with a gentle EMA to stop it jittering around centre
   const smoothedCentsRef = useRef<number>(0)
-  const CENTS_ALPHA = 0.15
+  const CENTS_ALPHA = 0.08
 
   const startListening = useCallback(async () => {
     setStatus('loading')
@@ -181,9 +181,9 @@ export default function App() {
   // Fade out when close to centre: invisible below 8 cents, fully visible above 25 cents
   // Dead zone is 3 cents. Outside it, minimum opacity is 0.55 so the bar is
   // clearly readable even when nearly in tune. Scales to full brightness at 30+ cents.
-  const centsBarOpacity = absCents < 3 ? 0 : Math.min(1, Math.max(0.55, absCents / 30))
-  // In-tune dot: matches the 3 cent dead zone
-  const inTuneOpacity = status === 'listening' ? Math.min(1, Math.max(0, (3 - absCents) / 1.5)) : 0
+  const centsBarOpacity = absCents < 6 ? 0 : Math.min(1, Math.max(0.55, absCents / 30))
+  // In-tune dot: fully visible within 4 cents, fades out by 6 cents (matches bar dead zone)
+  const inTuneOpacity = status === 'listening' ? Math.min(1, Math.max(0, (6 - absCents) / 2)) : 0
 
   return (
     <div className="min-h-screen bg-[#0c0c0c] text-white flex flex-col items-center justify-center gap-12">
@@ -214,13 +214,15 @@ export default function App() {
         <div className="absolute left-1/2 -top-1 w-px h-[3px] bg-white/20" />
         {/* In-tune dot — fades in when within 8 cents of perfect pitch */}
         <div
-          className="absolute w-[6px] h-[6px] rounded-full bg-emerald-400"
+          className="absolute w-[10px] h-[10px] rounded-full bg-emerald-400"
           style={{
             left: '50%',
             top: '50%',
             transform: 'translate(-50%, -50%)',
             opacity: inTuneOpacity,
-            transition: 'opacity 150ms ease-out',
+            // Halo fades in when within 2 cents of perfect pitch
+            boxShadow: `0 0 ${Math.max(0, (2 - absCents) / 2) * 12}px ${Math.max(0, (2 - absCents) / 2) * 8}px rgba(52, 211, 153, ${Math.max(0, (2 - absCents) / 2) * 0.8})`,
+            transition: 'opacity 150ms ease-out, box-shadow 150ms ease-out',
           }}
         />
         <div

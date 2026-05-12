@@ -5,6 +5,8 @@
 // wasm_bindgen allows us to mark functions as callable from JavaScript.
 // The cfg_attr here means "only apply #[wasm_bindgen] when compiling for WASM".
 // When building the CLI, this attribute is ignored entirely.
+use std::f32::consts::PI;
+use rustfft::{FftPlanner, num_complex::Complex};
 use wasm_bindgen::prelude::*;
 
 // --- YIN PITCH DETECTION ---
@@ -188,6 +190,215 @@ pub fn detect_frequency(samples: &[f32], sample_rate: u32) -> f32 {
     yin_pitch(samples, sample_rate).unwrap_or(0.0)
 }
 
+// --- FFT PEAK DETECTION ---
+//
+// Unlike YIN (which works in the time domain), FFT converts the audio frame
+// to the frequency domain: each output bin tells us how loud a particular
+// frequency is in the signal. We then pick the loudest peaks to find which
+// notes are present simultaneously.
+//
+// We apply a Hann window before the FFT to prevent "spectral leakage" —
+// without it, discontinuities at the buffer edges smear energy across bins
+// and bury real peaks in noise.
+
+/// Returns up to `max_peaks` frequencies (in Hz) that are loudest in the
+/// guitar range (70–1200 Hz). Results are sorted by magnitude, loudest first.
+fn fft_peaks(samples: &[f32], sample_rate: u32, max_peaks: usize) -> Vec<f32> {
+    let n = samples.len();
+    if n == 0 {
+        return vec![];
+    }
+
+    // Apply Hann window: w[i] = 0.5 * (1 - cos(2π·i / (N-1)))
+    // This tapers the buffer edges to zero, eliminating the edge-discontinuity
+    // artefact that would otherwise leak energy across the entire spectrum.
+    let mut buffer: Vec<Complex<f32>> = samples
+        .iter()
+        .enumerate()
+        .map(|(i, &s)| {
+            let w = 0.5 * (1.0 - (2.0 * PI * i as f32 / (n - 1) as f32).cos());
+            Complex { re: s * w, im: 0.0 }
+        })
+        .collect();
+
+    // Run the forward FFT. After this, buffer[k] holds the complex amplitude
+    // of frequency k * sample_rate / n Hz.
+    let mut planner = FftPlanner::new();
+    let fft = planner.plan_fft_forward(n);
+    fft.process(&mut buffer);
+
+    // Compute magnitudes for the first half of the spectrum only.
+    // The FFT output is symmetric — the second half mirrors the first —
+    // so everything above sample_rate/2 (the Nyquist limit) is redundant.
+    let magnitudes: Vec<f32> = buffer[..n / 2].iter().map(|c| c.norm()).collect();
+
+    // Translate the guitar frequency range into FFT bin indices.
+    // Bin k corresponds to frequency: f = k * sample_rate / n
+    // So bin for frequency f = f * n / sample_rate
+    let bin_min = ((70.0_f32 * n as f32) / sample_rate as f32) as usize;
+    let bin_max = ((1200.0_f32 * n as f32) / sample_rate as f32).min((n / 2 - 1) as f32) as usize;
+
+    // Adaptive noise floor: require a peak to be at least 15% of the loudest
+    // signal in range. Too low → guitar harmonics trigger false chord tones;
+    // too high → quiet strings in a chord get missed.
+    let range_max = magnitudes[bin_min..=bin_max]
+        .iter()
+        .cloned()
+        .fold(0.0_f32, f32::max);
+    if range_max == 0.0 {
+        return vec![];
+    }
+    let noise_floor = range_max * 0.15;
+
+    // Find local maxima above the noise floor.
+    // A bin is a peak if it is greater than both its neighbours.
+    let mut peaks: Vec<(usize, f32)> = Vec::new();
+    for bin in (bin_min + 1)..bin_max {
+        let mag = magnitudes[bin];
+        if mag > noise_floor && mag > magnitudes[bin - 1] && mag > magnitudes[bin + 1] {
+            peaks.push((bin, mag));
+        }
+    }
+
+    // Keep only the strongest N peaks.
+    peaks.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    peaks.truncate(max_peaks);
+
+    // Convert each peak bin to Hz using parabolic interpolation.
+    // Our bin estimates are integers, but the true peak likely falls between
+    // two bins. Fitting a parabola through the three points around the peak
+    // gives a sub-bin frequency estimate — the same trick used in YIN's
+    // parabolic interpolation step.
+    peaks
+        .iter()
+        .map(|&(bin, _)| {
+            if bin > 0 && bin + 1 < magnitudes.len() {
+                let s0 = magnitudes[bin - 1];
+                let s1 = magnitudes[bin];
+                let s2 = magnitudes[bin + 1];
+                let denom = s0 - 2.0 * s1 + s2;
+                let offset = if denom.abs() > 1e-6 {
+                    0.5 * (s0 - s2) / denom
+                } else {
+                    0.0
+                };
+                (bin as f32 + offset) * sample_rate as f32 / n as f32
+            } else {
+                bin as f32 * sample_rate as f32 / n as f32
+            }
+        })
+        .collect()
+}
+
+// --- PITCH CLASS ---
+//
+// A "pitch class" strips the octave from a note, leaving just its position
+// within a single octave: C=0, C#=1, D=2, ..., B=11.
+// E2 (82 Hz) and E4 (330 Hz) both map to pitch class 4.
+// This is the key step that lets us identify chords regardless of which
+// voicing (set of octaves) the guitarist plays.
+
+fn freq_to_pitch_class(freq: f32) -> u8 {
+    // Semitones above/below A4 (440 Hz). log2 gives octaves; × 12 gives semitones.
+    let semitones_from_a4 = 12.0 * (freq / 440.0_f32).log2();
+    // MIDI note number — A4 is note 69.
+    let midi_note = (69.0 + semitones_from_a4).round() as i32;
+    // rem_euclid handles negative MIDI numbers correctly (unlike plain %).
+    midi_note.rem_euclid(12) as u8
+}
+
+// --- CHORD IDENTIFICATION ---
+//
+// We try every combination of root note (C through B) × chord quality
+// (major, minor, 7th, etc.) and check whether all the required notes
+// for that chord are present in the detected pitch-class set.
+//
+// Scoring: prefer more specific patterns (more notes matched) and
+// penalise extra detected pitch classes that aren't in the chord
+// (extra notes suggest harmonics or noise rather than a real chord tone).
+
+fn identify_chord(pitch_classes: &[u8]) -> Option<String> {
+    // Need at least two distinct pitch classes to name a chord.
+    if pitch_classes.len() < 2 {
+        return None;
+    }
+
+    let note_names = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
+
+    // Each entry is (display suffix, semitone intervals from root).
+    // Four-note patterns listed first so they score higher than their three-note subsets
+    // when all four tones are detected.
+    let patterns: &[(&str, &[u8])] = &[
+        ("maj7",  &[0, 4, 7, 11]),
+        ("m7",    &[0, 3, 7, 10]),
+        ("7",     &[0, 4, 7, 10]),
+        ("dim7",  &[0, 3, 6,  9]),
+        ("m7b5",  &[0, 3, 6, 10]),
+        ("",      &[0, 4, 7]),       // major — no suffix, e.g. "C"
+        ("m",     &[0, 3, 7]),
+        ("dim",   &[0, 3, 6]),
+        ("aug",   &[0, 4, 8]),
+        ("sus2",  &[0, 2, 7]),
+        ("sus4",  &[0, 5, 7]),
+        ("5",     &[0, 7]),          // power chord
+    ];
+
+    let mut best: Option<(String, i32)> = None;
+
+    for &(suffix, pattern) in patterns {
+        for root in 0u8..12 {
+            // Build the absolute pitch classes this chord requires.
+            let chord_pcs: Vec<u8> = pattern
+                .iter()
+                .map(|&interval| (root + interval) % 12)
+                .collect();
+
+            // All chord tones must be present in the detected set.
+            let all_present = chord_pcs.iter().all(|pc| pitch_classes.contains(pc));
+            if !all_present {
+                continue;
+            }
+
+            // Score = (number of chord tones × 10) − (number of extra detected notes).
+            // More chord tones = more specific = better.
+            // Extra notes = likely harmonics = worse.
+            let extras = pitch_classes.len() as i32 - chord_pcs.len() as i32;
+            let score = chord_pcs.len() as i32 * 10 - extras;
+
+            if best.is_none() || score > best.as_ref().unwrap().1 {
+                best = Some((
+                    format!("{}{}", note_names[root as usize], suffix),
+                    score,
+                ));
+            }
+        }
+    }
+
+    best.map(|(name, _)| name)
+}
+
+// --- WASM CHORD EXPORT ---
+//
+// Takes a raw audio frame and returns a chord name string like "Em", "C", "G7",
+// or "—" if no confident chord was found.
+// This is called by the chord page in the frontend on each audio frame.
+#[wasm_bindgen]
+pub fn detect_chord(samples: &[f32], sample_rate: u32) -> String {
+    // Find up to 6 loudest frequency peaks in the guitar range.
+    let peaks = fft_peaks(samples, sample_rate, 6);
+    if peaks.is_empty() {
+        return "\u{2014}".to_string(); // "—"
+    }
+
+    // Convert each peak to a pitch class and deduplicate.
+    // Octave-equivalent notes (E2, E4) both map to "E" and collapse into one.
+    let mut pitch_classes: Vec<u8> = peaks.iter().map(|&f| freq_to_pitch_class(f)).collect();
+    pitch_classes.sort();
+    pitch_classes.dedup();
+
+    identify_chord(&pitch_classes).unwrap_or_else(|| "\u{2014}".to_string())
+}
+
 // --- UNIT TESTS ---
 //
 // `cargo test` runs these. They live inside the library so they have access to private internals.
@@ -195,7 +406,6 @@ pub fn detect_frequency(samples: &[f32], sample_rate: u32) -> f32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f32::consts::PI;
 
     // Helper: generate a pure sine wave at a given frequency
     fn sine_wave(freq: f32, sample_rate: u32, duration_secs: f32) -> Vec<f32> {
